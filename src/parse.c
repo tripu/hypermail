@@ -354,10 +354,21 @@ void crossindex(void)
 				    &maybereply);
 	if (status != -1) {
 	    struct emailinfo *email2;
+            
 	    if (!hashnumlookup(status, &email2)) {
 		++num;
 		continue;
 	    }
+	    /*  make sure there is no recursion between the message
+                and reply lookup if a message and its reply-to were
+                archived in reverse, both messages share the same
+                subject (regardless of Re), and the message itself was
+                a reply to a non-archived message. */
+	    if (maybereply && !strcmp (email2->inreplyto, email->msgid)) {
+                ++num;
+                continue;
+            }
+            
 	    if (set_linkquotes) {
 	        struct reply *rp;
 		int found_num = 0;
@@ -653,6 +664,66 @@ char *getsubject(char *line)
 }
 
 /*
+** Grabs the annotation values given in the annotation user-defined header
+** 
+** annotation_content is set to the value of the content annotation
+** annotation_robot is set to the values of the robot annotations
+** Returns TRUE if an annotation was found, FALSE otherwise.
+*/
+
+static bool
+getannotation(char *line, annotation_content_t *annotation_content,
+	       annotation_robot_t *annotation_robot)
+{
+  char *c;
+
+  *annotation_content = ANNOTATION_CONTENT_NONE;;
+  *annotation_robot = ANNOTATION_ROBOT_NONE;
+  
+  c = strchr(line, ':');
+  if (!c)
+    return FALSE;
+  c++;
+
+  while (*c != '\n') {
+    int len;
+    char *startp;
+
+    while (isspace(*c))
+      c++;
+  
+    startp = c;
+    while (!isspace (*c) && *c != '\n' && *c != ',') {
+      c++;
+    }
+
+    len = (int) (c-startp);
+    if (len > 0) {
+      if (!strncasecmp (startp, "deleted", len)) {
+	*annotation_content = ANNOTATION_CONTENT_DELETED_OTHER;
+	break;
+      }
+      else if (!strncasecmp (startp, "spam", len)) {
+	*annotation_content = ANNOTATION_CONTENT_DELETED_SPAM;
+	break;
+      }
+      else if (!strncasecmp (startp, "edited", len))
+	*annotation_content = ANNOTATION_CONTENT_EDITED;
+      else if (!strncasecmp (startp, "noindex", len))
+	*annotation_robot |= ANNOTATION_ROBOT_NO_INDEX;
+      else if (!strncasecmp (startp, "nofollow", len))
+	*annotation_robot |= ANNOTATION_ROBOT_NO_FOLLOW;
+    }
+    if (*c == ',')
+      c++;
+  }
+
+  /* only return true if at least a valid annotation was found */
+  return (*annotation_content != ANNOTATION_CONTENT_NONE 
+	  || *annotation_robot != ANNOTATION_ROBOT_NONE);
+}
+
+/*
 ** Grabs the message ID, or date, from the In-reply-to: header.
 **
 ** Maybe I'm confused but....
@@ -918,6 +989,7 @@ static char *mdecodeRFC2047(char *string, int length, char *charsetsave)
 	    else if (!strcasecmp("b", encoding)) {
 		/* base64 decoding */
 		int len;
+	        size_t charsetlen;
 #ifdef HAVE_ICONV
                 size_t tmplen;
 		char *output2;
@@ -926,7 +998,9 @@ static char *mdecodeRFC2047(char *string, int length, char *charsetsave)
 		memcpy(output,output2,tmplen);
 		output += tmplen;
 		free(output2);
-		memcpy(charsetsave,charset,strlen(charset)<255 ? strlen(charset) : 255 );
+		charsetlen = strlen(charset) < 255 ? strlen(charset) : 255;
+		memcpy(charsetsave,charset,charsetlen);
+		charsetsave[charsetlen] = '\0';
 #else
 		base64Decode(ptr, output, &len);
 		output += len;
@@ -992,6 +1066,144 @@ static char *mdecodeRFC2047(char *string, int length, char *charsetsave)
 	free(storage);
 	return string;
     }
+}
+
+/* 
+** RFC 3676 format=flowed parsing routines
+*/
+
+/* get_quote_level returns the number of quotes in a line, 
+   following the RFC 3676 section 4.5 criteria.
+*/
+static int get_quotelevel (const char *line)
+{
+  int quoted = 0;
+  char *p = (char *) line;
+
+  while (p && *p == '>')
+  {
+    quoted++;
+    p++;
+  }
+
+  return quoted;
+}
+
+/*
+** rfc3676_handler parses lines according to RFC 3676.  Its inputs are
+** the current line to parse, the delsp value (from the message
+** headers), the previous line quotelevel, and a flag saying if the
+** previous line was marked as a continuing one.
+**
+** The function returns true if the current line should be merged with
+** the next line to be parsed. 
+**
+** The function updates the quotelevel to
+** that of the current parsed line. The function will update the
+** continue_prev_flow_flag to say if the current line should be joined
+** to the previous one, and, if positive, the padding offset that
+** should be applied to the current line when merging it (for skipping
+** quotes or space-padding).
+*/
+static bool rfc3676_handler (const char *line, bool delsp, int *quotelevel, 
+			     bool *continue_prev_flow_flag, int *padding)
+{
+  int new_quotelevel = 0;
+  int tmp_padding = 0;
+  bool sig_sep = FALSE;
+  bool flowed = FALSE;
+
+  /* rules for evaluation if the flow should stop:
+     1. new quote level is different from previous one
+     2. The line ends with a signature "(quotes)(stuffing)-- \n"
+  */
+
+  /* If this is line is part of the flow and begins with quotes,
+     remove the quote level and stuffed space if found */
+  new_quotelevel = get_quotelevel (line);
+
+#if DEBUG_PARSE
+  printf("RFC3676: Previous quote level: %d\n", quotelevel);
+  printf("RFC3676: Previous line flow flag: %d\n", continue_prev_flow_flag);
+  printf("RFC3676: New quote level: %d\n", new_quotelevel);
+#endif
+
+  /* remove the multi-line quotes padding */
+  tmp_padding = new_quotelevel;
+
+  if (*continue_prev_flow_flag 
+      && (new_quotelevel != *quotelevel 
+	  || (new_quotelevel == *quotelevel 
+	      && new_quotelevel > 0 
+	      && set_format_flowed_disable_quoted))) {
+    /* don't join */
+    *continue_prev_flow_flag = FALSE;
+  }
+
+  /* remove space stuffing if any */
+  if (line[tmp_padding] == ' ') {
+    tmp_padding++;
+  }
+
+  /* Is it a signature separator? */
+  if (!strcmp (line + tmp_padding, "-- \n") || !strcmp (line + tmp_padding, "-- \r\n")) {
+    /* don't join */
+    *continue_prev_flow_flag = FALSE;
+    sig_sep = TRUE;
+#if DEBUG_PARSE
+    printf("RFC3676: Current line is signature\n", sig_sep);
+#endif
+  }
+
+  if (*continue_prev_flow_flag == FALSE)
+    tmp_padding = 0;
+
+  *padding = tmp_padding;
+
+  /* is this line part of a flowed sequence (beginning or continuation)?  */
+  if (!sig_sep) {
+    char *eold;
+    eold = strrchr (line, '\n');
+    if (line != eold) {
+      if (*(eold - 1) == '\r')
+	eold--;
+    }
+    if (line != eold) {
+      if (*(eold - 1) == ' ') {
+	flowed = TRUE;
+	if (delsp) {
+	  /* remove the space stuffing and copy the end of line */
+	  char *ptr = eold - 1;
+#if DEBUG_PARSE
+	  printf("deleting delsp separator\n");
+#endif
+	  while (*ptr != '\0') {
+	    *ptr = *(ptr + 1);
+	    ptr++;
+	  }
+	}
+      }
+    }
+  }
+
+  if (flowed) {
+    *quotelevel = new_quotelevel;
+  } else {
+    *quotelevel = 0;
+  }
+
+#if DEBUG_PARSE
+  if (continue_prev_flow_flag)
+    printf("RFC3676: Continuing previous flow\n");
+  else
+    printf("RFC3676: Stopping previous flow\n");
+  if (flowed) {
+    printf("RFC3676: Current line is flowed\n");
+    printf("RFC3676: New quote level: %d\n", new_quotelevel);
+  }
+#endif
+
+  return flowed;
 }
 
 /*
@@ -1192,7 +1404,8 @@ static void write_txt_file(struct emailinfo *emp, struct Push *raw_text_buf)
     sprintf(tmp_buf, "%.4d", emp->msgnum);
     txt_filename = htmlfilename(tmp_buf, emp, set_txtsuffix);
     if ((!emp->is_deleted
-	 || ((emp->is_deleted & (FILTERED_DELETE | FILTERED_OLD | FILTERED_NEW))
+	 || ((emp->is_deleted & (FILTERED_DELETE | FILTERED_OLD | FILTERED_NEW 
+				 | FILTERED_DELETE_OTHER))
 	     && set_delete_level > 2)
 	 || (emp->is_deleted == FILTERED_EXPIRE && set_delete_level == 2))
 	&& (set_overwrite || !isfile(txt_filename))) {
@@ -1239,6 +1452,8 @@ int parsemail(char *mbox,	/* file name */
     long exp_time = -1;
     time_t delete_older_than = (set_delete_older ? convtoyearsecs(set_delete_older) : 0);
     time_t delete_newer_than = (set_delete_newer ? convtoyearsecs(set_delete_newer) : 0);
+    annotation_robot_t annotation_robot = ANNOTATION_ROBOT_NONE;
+    annotation_content_t annotation_content = ANNOTATION_CONTENT_NONE;
     int is_deleted = 0;
     int pos;
     bool *require_filter, *require_filter_full;
@@ -1298,6 +1513,13 @@ int parsemail(char *mbox,	/* file name */
 
     int bodyflags = 0;		/* This variable is set to extra flags that the 
 				   addbody() calls should OR in the flag parameter */
+
+    /* RFC 3676 related variables, set while parsing the headers and body content */
+    textplain_format_t textplain_format = FORMAT_FIXED;   
+    bool flowed_line = FALSE;
+    int quotelevel = 0;
+    bool continue_previous_flow_flag = FALSE;
+    bool delsp = FALSE; 
 
     int binfile = -1;
 
@@ -1490,6 +1712,16 @@ int parsemail(char *mbox,	/* file name */
 			if (exp_time != -1 && exp_time < time(NULL))
 			    is_deleted = FILTERED_EXPIRE;
 			free(val);
+		    }
+
+		    if (inlist(set_annotated, head_name)) {
+		      getannotation(head->line, &annotation_content,
+				    &annotation_robot);
+		      if (annotation_content == ANNOTATION_CONTENT_DELETED_OTHER)
+			is_deleted = FILTERED_DELETE_OTHER;
+		      else if (annotation_content == ANNOTATION_CONTENT_DELETED_SPAM)
+			is_deleted = FILTERED_DELETE;
+		      head->parsedheader = TRUE;
 		    }
 
 		    if (!is_deleted &&
@@ -1694,6 +1926,34 @@ int parsemail(char *mbox,	/* file name */
 			    sscanf(cp, "%128[^;\"\n]", charbuffer);
 			    /* save the charset info */
 			    charset = strsav(charbuffer);
+			}
+
+			/* now check if there's a format indicator */
+			if (set_format_flowed) {
+			  cp = strcasestr(ptr, "format=");
+			  if (cp) {
+			    cp += 7;	/* pass charset= */
+			    if ('\"' == *cp)
+			      cp++;	/* pass a quote too if one is there */
+			    
+			    sscanf(cp, "%128[^;\"\n]", charbuffer);
+			    /* save the format info */
+			    if (!strcasecmp (charbuffer, "flowed"))
+			      textplain_format = FORMAT_FLOWED;
+			  }
+			  
+			  /* now check if there's a delsp indicator */			
+			  cp = strcasestr(ptr, "delsp=");
+			  if (cp) {
+			    cp += 6;	/* pass charset= */
+			    if ('\"' == *cp)
+			      cp++;	/* pass a quote too if one is there */
+			    
+			    sscanf(cp, "%128[^;\"\n]", charbuffer);
+			    /* save the delsp info */
+			    if (!strcasecmp (charbuffer, "yes"))
+			      delsp = TRUE;
+			  }
 			}
 
 			if (alternativeparser) {
@@ -2097,6 +2357,19 @@ int parsemail(char *mbox,	/* file name */
 		if (!inreply)
 		    inreply = oneunre(subject);
 
+		/* control the use of format and delsp according to RFC 3676 */
+		if (textplain_format == FORMAT_FLOWED 
+		    && content != CONTENT_TEXT
+		    || (content == CONTENT_TEXT && strcasecmp (type, "text/plain"))) {
+		  /* format flowed only allowed on text/plain */
+		  textplain_format = FORMAT_FIXED;
+		}
+
+		if (textplain_format == FORMAT_FIXED && delsp) {
+		  /* delsp only accepted for format=flowed */
+		  delsp = FALSE;
+		}
+
 		if (append_bp && append_bp != bp) {
 		   /* if we had attachments, close the structure */
 		    append_bp = 
@@ -2151,6 +2424,9 @@ msgid);
 		if (emp) {
 		    emp->exp_time = exp_time;
 		    emp->is_deleted = is_deleted;
+		    emp->annotation_robot = annotation_robot;
+		    emp->annotation_content = annotation_content;
+
 		    if (insert_in_lists(emp, require_filter,
 					require_filter_len + require_filter_full_len))
 		        ++num_added;
@@ -2198,6 +2474,13 @@ msgid);
 		bp = NULL;
 		bodyflags = 0;	/* reset state flags */
 
+		/* reset related RFC 3676 state flags */
+		textplain_format = FORMAT_FIXED;
+		delsp = FALSE;
+		flowed_line = FALSE;
+		quotelevel = 0;
+		continue_previous_flow_flag = FALSE;
+
 		/* go back to default mode: */
 		content = CONTENT_TEXT;
 		decode = ENCODE_NORMAL;
@@ -2220,6 +2503,9 @@ msgid);
 		/* by default we have none! */
 		hassubject = 0;
 		hasdate = 0;
+
+		annotation_robot = ANNOTATION_ROBOT_NONE;
+		annotation_content = ANNOTATION_CONTENT_NONE;
 
 		is_deleted = 0;
 		exp_time = -1;
@@ -2338,6 +2624,13 @@ msgid);
 			decode = ENCODE_NORMAL;
 			multilinenoend = FALSE;
 
+			/* reset related RFC 3676 state flags */
+			textplain_format = FORMAT_FIXED;
+			delsp = FALSE;
+			flowed_line = FALSE;
+			quotelevel = 0;
+			continue_previous_flow_flag = FALSE;
+
 			if (-1 != binfile) {
 			    close(binfile);
 			    binfile = -1;
@@ -2435,15 +2728,36 @@ msgid);
 			    }
 			}
 			else {
-			    bp = addbody(bp, &lp, data,
-					 (content == CONTENT_HTML ?
-					  BODY_HTMLIZED : 0) | bodyflags);
+			  int padding; /* used for skipping padding detected by rfc3676_handler,
+					  which seems smarter than moving all the bytes in data
+					  before injecting it into addbody */
+			  if (!isinheader && textplain_format == FORMAT_FLOWED) {
+			    flowed_line = rfc3676_handler (data, delsp, &quotelevel, 
+							   &continue_previous_flow_flag, &padding);
+			    if (continue_previous_flow_flag)
+			      bodyflags |= BODY_CONTINUE;
+			    else
+			      bodyflags &= ~BODY_CONTINUE;
+			    continue_previous_flow_flag = flowed_line;
+			  } else {
+			    padding = 0;
+			  }
+			  bp = addbody(bp, &lp, data + padding,
+				       (content == CONTENT_HTML ?
+					BODY_HTMLIZED : 0) | bodyflags);
 			}
 #if DEBUG_PARSE
 			printf("ALIVE?\n");
 #endif
 		    }
 		    else if (content == CONTENT_BINARY) {
+
+		        /* don't create the attachments of deleted files */
+		        /* (JK: this seems like a good place to call emptydir() to remove
+			   existing attachments) from deleted messages */
+		        if (is_deleted && file_created == MAKE_FILE) {
+			  file_created = MADE_FILE;
+			}
 
 #ifndef REMOVED_990310
 			/* If there is no file created, we create and init one */
@@ -2573,6 +2887,19 @@ msgid);
 						    fprintf(file_ptr,
 							    "Content-Type: %s\n",
 							    type);
+					    }
+					    if (annotation_robot && set_userobotmeta) {
+					      /* annotate the attachments using the experimental
+						 google X-Robots-Tag HTTP header.
+						 See https://developers.google.com/webmasters/control-crawl-index/docs/robots_meta_tag */
+					      char *value;
+					      if (annotation_robot == 1) 
+						value = "nofollow";
+					      else if (annotation_robot == 2)
+						value = "noindex";
+					      else if (annotation_robot == 3)
+						value = "nofollow, noindex";
+					      fprintf(file_ptr,"X-Robots-Tag: %s\n", value);
 					    }
 					    fclose(file_ptr);
 					    chmod(meta_file, set_filemode);
@@ -2764,6 +3091,19 @@ msgid);
 	if (!inreply)
 	    inreply = oneunre(subject);
 
+	/* control the use of format and delsp according to RFC2646 */
+	if (textplain_format == FORMAT_FLOWED 
+	    && content != CONTENT_TEXT
+	    || (content == CONTENT_TEXT && strcasecmp (type, "text/plain"))) {
+	  /* format flowed only allowed on text/plain */
+	  textplain_format = FORMAT_FIXED;
+	}
+
+	if (textplain_format == FORMAT_FIXED && delsp) {
+	  /* delsp only accepted for format=flowed */
+	  delsp = FALSE;
+	}
+
 	if (append_bp && append_bp != bp) {
 	  /* close the DIV */
 	  append_bp = 
@@ -2781,6 +3121,8 @@ msgid);
 	if (emp) {
 	    emp->exp_time = exp_time;
 	    emp->is_deleted = is_deleted;
+	    emp->annotation_robot = annotation_robot;
+	    emp->annotation_content = annotation_content;
 	    if (insert_in_lists(emp, require_filter,
 				require_filter_len + require_filter_full_len))
 	        ++num_added;
@@ -2825,6 +3167,13 @@ msgid);
 	/* @@ verify we're doing it everywhere */
 	bodyflags = 0;		/* reset state flags */
 
+	/* reset related RFC 3676 state flags */
+	textplain_format = FORMAT_FIXED;
+	delsp = FALSE;
+	flowed_line = FALSE;
+	quotelevel = 0;
+	continue_previous_flow_flag = FALSE;
+	
 	/* go back to default mode: */
 	content = CONTENT_TEXT;
 	decode = ENCODE_NORMAL;
@@ -2852,6 +3201,9 @@ msgid);
 	/* by default we have none! */
 	hassubject = 0;
 	hasdate = 0;
+
+	annotation_robot = ANNOTATION_ROBOT_NONE;
+	annotation_content = ANNOTATION_CONTENT_NONE;
     }
     if (require_filter) free(require_filter);
 
@@ -3964,7 +4316,7 @@ void fixreplyheader(char *dir, int num, int remove_maybes, int max_update)
 		    || strcasestr(bp->line, old2_next_pattern)
 		    || strstr(bp->line, old_next_pattern))) {
 	        bp = bp->next;
-		continue; /* line duplicates next in thread; surpress */
+		continue; /* line duplicates next in thread; suppress */
 	    }
 
 	    if (!remove_maybes
@@ -4137,3 +4489,4 @@ int count_deleted(int limit)
     }
     return total;
 }
+
